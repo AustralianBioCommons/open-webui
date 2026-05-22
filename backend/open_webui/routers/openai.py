@@ -26,6 +26,7 @@ from open_webui.internal.db import get_session
 from open_webui.models.models import Models
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.groups import Groups
+from open_webui.models.chats import Chats
 from open_webui.config import (
     CACHE_DIR,
 )
@@ -57,6 +58,13 @@ from open_webui.utils.misc import (
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
+from open_webui.utils.openclaw_bridge import (
+    add_continuity_message,
+    apply_openclaw_headers,
+    build_continuity_message,
+    is_openclaw_gateway,
+    should_inject_continuity,
+)
 
 log = logging.getLogger(__name__)
 
@@ -209,7 +217,39 @@ async def get_headers_and_cookies(
     if config.get('headers') and isinstance(config.get('headers'), dict):
         headers = {**headers, **config.get('headers')}
 
+    if is_openclaw_gateway(url, config) and user:
+        headers = apply_openclaw_headers(
+            headers,
+            user_id=user.id,
+            chat_id=metadata.get('chat_id') if metadata else None,
+        )
+
     return headers, cookies
+
+
+def inject_openclaw_continuity(payload: dict, metadata: Optional[dict], user: UserModel) -> dict:
+    messages = payload.get('messages')
+    if not should_inject_continuity(metadata, messages):
+        return payload
+
+    try:
+        current_chat_id = metadata.get('chat_id')
+        chats = Chats.get_chat_list_by_user_id(user.id, include_archived=False, limit=3)
+        previous_chat = next((chat for chat in chats if chat.id != current_chat_id), None)
+        if previous_chat is None:
+            return payload
+
+        continuity_message = build_continuity_message(previous_chat)
+        if continuity_message is None:
+            return payload
+
+        return {
+            **payload,
+            'messages': add_continuity_message(messages, continuity_message),
+        }
+    except Exception as e:
+        log.debug(f'OpenClaw continuity injection skipped: {e}')
+        return payload
 
 
 def get_microsoft_entra_id_access_token():
@@ -1115,6 +1155,10 @@ async def generate_chat_completion(
 
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
+
+    if is_openclaw_gateway(url, api_config):
+        payload['user'] = str(user.id)
+        payload = inject_openclaw_continuity(payload, metadata, user)
 
     # Check if model is a reasoning model that needs special handling
     if is_openai_new_model(payload['model']):
